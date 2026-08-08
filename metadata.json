@@ -1,0 +1,6 @@
+{
+  "name": "IronMark",
+  "description": "High-performance JavaScript Bridge and Large-File Processing Engine",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
