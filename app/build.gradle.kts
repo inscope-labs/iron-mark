@@ -17,8 +17,10 @@ android {
     applicationId = "com.inscopelabs.abx.ironmark"
     minSdk = 26
     targetSdk = 34
-    versionCode = 1
-    versionName = "1.0"
+    val codeProp = project.findProperty("versionCode")?.toString()?.toIntOrNull()
+    val nameProp = project.findProperty("versionName")?.toString()
+    versionCode = codeProp ?: 1
+    versionName = nameProp ?: "1.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
