@@ -62,7 +62,8 @@ fun ScriptStudioScreen(
 
     val templates = listOf(
         IronMarkViewModel.DEFAULT_SPLITTER_SCRIPT,
-        IronMarkViewModel.SHA_HASH_SCRIPT
+        IronMarkViewModel.SHA_HASH_SCRIPT,
+        IronMarkViewModel.CHAT_RESPONSE_SPLITTER_SCRIPT
     )
 
     LazyColumn(

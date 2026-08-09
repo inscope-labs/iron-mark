@@ -179,13 +179,12 @@ class IronMarkViewModel(application: Application) : AndroidViewModel(application
             val wrapperScript = """
                 (function() {
                     try {
-                        const params = $paramsJson;
+                        const params = Object.assign({}, $paramsJson, { fileUri: "${_selectedFile.value?.uri ?: ""}" });
                         $scriptCode
                         if (typeof runCustomScript === 'function') {
                             return runCustomScript(params);
                         } else if (typeof splitFile === 'function') {
-                            const fileUri = "${_selectedFile.value?.uri ?: ""}";
-                            return splitFile(fileUri, params.chunkSizeMB || 10);
+                            return splitFile(params.fileUri, params.chunkSizeMB || 10);
                         }
                         return JSON.stringify({ status: "Script executed without explicit return function" });
                     } catch (e) {
@@ -323,6 +322,118 @@ function runCustomScript(params) {
 }
             """.trimIndent(),
             defaultParamsJson = "{\n  \"mode\": \"fast\"\n}"
+        )
+
+        val CHAT_RESPONSE_SPLITTER_SCRIPT = ScriptTemplate(
+            id = "chat_response_splitter",
+            name = "Chat Response Splitter (copy-inbox)",
+            description = "Splits an AI agent's response text into copy-inbox-safe chunks (~18KB) at natural boundaries — headers, paragraphs, sentences — instead of arbitrary byte offsets. Code fences are kept intact where possible.",
+            code = """
+function runCustomScript(params) {
+  const fileUri = params.fileUri;
+  if (!fileUri) {
+    return JSON.stringify({ error: "No file selected" });
+  }
+  const fileSize = Android.getFileSize(fileUri);
+  if (fileSize <= 0) {
+    return JSON.stringify({ error: "File empty or invalid URI" });
+  }
+
+  const chunkSize = 1024 * 1024;
+  let fullText = "";
+  for (let offset = 0; offset < fileSize; offset += chunkSize) {
+    const bytesToRead = Math.min(chunkSize, fileSize - offset);
+    const b64 = Android.readChunk(fileUri, offset, bytesToRead);
+    const binStr = atob(b64);
+    const bytes = new Uint8Array(binStr.length);
+    for (let i = 0; i < binStr.length; i++) {
+      bytes[i] = binStr.charCodeAt(i);
+    }
+    fullText += new TextDecoder('utf-8').decode(bytes);
+  }
+
+  const maxBytes = params.maxChunkBytes || 18000;
+  const strategy = params.strategy || "size";
+  const addMarkers = params.addMarkers !== false;
+
+  const encoder = new TextEncoder();
+  function byteLength(str) {
+    return encoder.encode(str).length;
+  }
+
+  const lines = fullText.split("\n");
+  const rawChunks = [];
+  let currentChunkLines = [];
+  let currentBytes = 0;
+  let inCodeFence = false;
+  let codeFenceLang = "";
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const lineBytes = byteLength(line + "\n");
+
+    const trimmed = line.trim();
+    if (trimmed.startsWith("```")) {
+      if (!inCodeFence) {
+        inCodeFence = true;
+        codeFenceLang = trimmed.substring(3);
+      } else {
+        inCodeFence = false;
+        codeFenceLang = "";
+      }
+    }
+
+    if (currentBytes + lineBytes > maxBytes && currentChunkLines.length > 0) {
+      if (inCodeFence) {
+        currentChunkLines.push("```");
+      }
+      rawChunks.push({ lines: currentChunkLines });
+      currentChunkLines = [];
+      currentBytes = 0;
+
+      if (inCodeFence) {
+        const openFence = "```" + codeFenceLang;
+        currentChunkLines.push(openFence);
+        currentBytes += byteLength(openFence + "\n");
+      }
+    }
+
+    currentChunkLines.push(line);
+    currentBytes += lineBytes;
+  }
+
+  if (currentChunkLines.length > 0) {
+    if (inCodeFence) {
+      currentChunkLines.push("```");
+    }
+    rawChunks.push({ lines: currentChunkLines });
+  }
+
+  const parts = [];
+  const totalChunks = rawChunks.length;
+
+  for (let i = 0; i < totalChunks; i++) {
+    let content = rawChunks[i].lines.join("\n");
+    if (addMarkers) {
+      const marker = "[Part " + (i + 1) + " of " + totalChunks + "]\n";
+      content = marker + content;
+    }
+    const filename = "chat_response_part_" + (i + 1) + ".txt";
+    const savedPath = Android.writeFile(filename, content);
+    parts.push(savedPath);
+
+    const percent = Math.round(((i + 1) / totalChunks) * 100);
+    Android.reportProgress(percent);
+  }
+
+  return JSON.stringify({
+    totalChunks: parts.length,
+    strategy: strategy,
+    parts: parts
+  });
+}
+            """.trimIndent(),
+            defaultParamsJson = "{\n  \"strategy\": \"size\",\n  \"maxChunkBytes\": 18000,\n  \"addMarkers\": true\n}"
         )
     }
 }
