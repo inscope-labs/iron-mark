@@ -330,106 +330,232 @@ function runCustomScript(params) {
             description = "Splits an AI agent's response text into copy-inbox-safe chunks (~18KB) at natural boundaries — headers, paragraphs, sentences — instead of arbitrary byte offsets. Code fences are kept intact where possible.",
             code = """
 function runCustomScript(params) {
-  const fileUri = params.fileUri;
-  if (!fileUri) {
-    return JSON.stringify({ error: "No file selected" });
-  }
-  const fileSize = Android.getFileSize(fileUri);
-  if (fileSize <= 0) {
-    return JSON.stringify({ error: "File empty or invalid URI" });
-  }
+  var fileUri = params.fileUri;
+  var strategy = params.strategy || 'size';
+  var maxChunkBytes = params.maxChunkBytes || 18000;
+  var addMarkers = params.addMarkers !== false;
+  var markerReserve = addMarkers ? 40 : 0;
+  var effectiveMax = maxChunkBytes - markerReserve;
 
-  const chunkSize = 1024 * 1024;
-  let fullText = "";
-  for (let offset = 0; offset < fileSize; offset += chunkSize) {
-    const bytesToRead = Math.min(chunkSize, fileSize - offset);
-    const b64 = Android.readChunk(fileUri, offset, bytesToRead);
-    const binStr = atob(b64);
-    const bytes = new Uint8Array(binStr.length);
-    for (let i = 0; i < binStr.length; i++) {
-      bytes[i] = binStr.charCodeAt(i);
-    }
-    fullText += new TextDecoder('utf-8').decode(bytes);
-  }
-
-  const maxBytes = params.maxChunkBytes || 18000;
-  const strategy = params.strategy || "size";
-  const addMarkers = params.addMarkers !== false;
-
-  const encoder = new TextEncoder();
   function byteLength(str) {
-    return encoder.encode(str).length;
+    return new TextEncoder().encode(str).length;
   }
 
-  const lines = fullText.split("\n");
-  const rawChunks = [];
-  let currentChunkLines = [];
-  let currentBytes = 0;
-  let inCodeFence = false;
-  let codeFenceLang = "";
+  // ---- read + decode the whole file (responses top out ~80KB, so a
+  // single read is fine - no need to stream in pieces) ----
+  var fileSize = Android.getFileSize(fileUri);
+  if (fileSize <= 0) {
+    return JSON.stringify({ error: 'File empty or invalid URI: ' + fileUri });
+  }
+  window.progressUpdate(10);
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const lineBytes = byteLength(line + "\n");
+  var base64 = Android.readChunk(fileUri, 0, fileSize);
+  var binaryStr = atob(base64);
+  var bytes = new Uint8Array(binaryStr.length);
+  for (var bi = 0; bi < binaryStr.length; bi++) bytes[bi] = binaryStr.charCodeAt(bi);
+  var text = new TextDecoder('utf-8').decode(bytes);
+  window.progressUpdate(25);
 
-    const trimmed = line.trim();
-    if (trimmed.startsWith("```")) {
-      if (!inCodeFence) {
-        inCodeFence = true;
-        codeFenceLang = trimmed.substring(3);
+  // ---- structural parsing: text -> ordered blocks ----
+  function parseBlocks(src) {
+    var lines = src.split('\n');
+    var blocks = [];
+    var i = 0;
+    while (i < lines.length) {
+      var line = lines[i];
+      var fenceMatch = line.match(/^(\s*)(```|~~~)/);
+      if (fenceMatch) {
+        var fence = fenceMatch[2];
+        var start = i;
+        i++;
+        while (i < lines.length && lines[i].trim().indexOf(fence) !== 0) i++;
+        if (i < lines.length) i++;
+        blocks.push({ type: 'code', text: lines.slice(start, i).join('\n') });
+        continue;
+      }
+      if (/^#{1,6}\s/.test(line)) {
+        blocks.push({ type: 'header', text: line, level: line.match(/^#+/)[0].length });
+        i++;
+        continue;
+      }
+      if (line.trim() === '') { i++; continue; }
+      var pstart = i;
+      while (
+        i < lines.length &&
+        lines[i].trim() !== '' &&
+        !/^#{1,6}\s/.test(lines[i]) &&
+        !/^(\s*)(```|~~~)/.test(lines[i])
+      ) { i++; }
+      blocks.push({ type: 'paragraph', text: lines.slice(pstart, i).join('\n') });
+    }
+    return blocks;
+  }
+
+  // ---- fallback splitters for a single oversized block ----
+  function packUnits(units, maxBytes, fallback) {
+    var chunks = [];
+    var current = '';
+    for (var u = 0; u < units.length; u++) {
+      var unit = units[u];
+      if (byteLength(unit) > maxBytes) {
+        if (current) { chunks.push(current); current = ''; }
+        chunks = chunks.concat(fallback(unit, maxBytes));
+        continue;
+      }
+      var candidate = current + unit;
+      if (byteLength(candidate) > maxBytes) {
+        if (current) chunks.push(current);
+        current = unit;
       } else {
-        inCodeFence = false;
-        codeFenceLang = "";
+        current = candidate;
       }
     }
+    if (current) chunks.push(current);
+    return chunks;
+  }
 
-    if (currentBytes + lineBytes > maxBytes && currentChunkLines.length > 0) {
-      if (inCodeFence) {
-        currentChunkLines.push("```");
+  function splitByChar(str, maxBytes) {
+    var chunks = [];
+    var current = '';
+    var chars = Array.from(str); // code-point aware, never mid-multibyte-char
+    for (var c = 0; c < chars.length; c++) {
+      if (byteLength(current + chars[c]) > maxBytes) {
+        chunks.push(current);
+        current = chars[c];
+      } else {
+        current += chars[c];
       }
-      rawChunks.push({ lines: currentChunkLines });
-      currentChunkLines = [];
-      currentBytes = 0;
+    }
+    if (current) chunks.push(current);
+    return chunks;
+  }
 
-      if (inCodeFence) {
-        const openFence = "```" + codeFenceLang;
-        currentChunkLines.push(openFence);
-        currentBytes += byteLength(openFence + "\n");
+  function splitByWord(str, maxBytes) {
+    var words = str.split(/(\s+)/);
+    return packUnits(words, maxBytes, splitByChar);
+  }
+
+  function splitBySentence(str, maxBytes) {
+    var sentences = str.match(/[^.!?]+[.!?]+(\s+|$)/g) || [str];
+    return packUnits(sentences, maxBytes, splitByWord);
+  }
+
+  function splitCodeBlock(block, maxBytes) {
+    var lines = block.text.split('\n');
+    var fenceLine = lines[0];
+    var closeLine = lines[lines.length - 1];
+    var body = lines.slice(1, -1);
+    var overhead = byteLength(fenceLine) + byteLength(closeLine) + 2;
+    var budget = Math.max(maxBytes - overhead, 200);
+    var bodyLines = body.map(function (l) { return l + '\n'; });
+    var bodyChunks = packUnits(bodyLines, budget, splitByChar);
+    return bodyChunks.map(function (c) { return fenceLine + '\n' + c + closeLine; });
+  }
+
+  // ---- strategies ----
+  function splitBySize(blocks, maxBytes) {
+    var chunks = [];
+    var current = '';
+    for (var i = 0; i < blocks.length; i++) {
+      var b = blocks[i];
+      if (b.type === 'code' && byteLength(b.text) > maxBytes) {
+        if (current) { chunks.push(current); current = ''; }
+        chunks = chunks.concat(splitCodeBlock(b, maxBytes));
+        continue;
+      }
+      var piece = b.text + '\n\n';
+      if (byteLength(piece) > maxBytes) {
+        if (current) { chunks.push(current); current = ''; }
+        chunks = chunks.concat(splitBySentence(piece, maxBytes));
+        continue;
+      }
+      var candidate = current + piece;
+      if (byteLength(candidate) > maxBytes) {
+        chunks.push(current.replace(/\s+$/, ''));
+        current = piece;
+      } else {
+        current = candidate;
       }
     }
-
-    currentChunkLines.push(line);
-    currentBytes += lineBytes;
+    if (current.trim()) chunks.push(current.replace(/\s+$/, ''));
+    return chunks;
   }
 
-  if (currentChunkLines.length > 0) {
-    if (inCodeFence) {
-      currentChunkLines.push("```");
+  function splitBySection(blocks, maxBytes) {
+    var sections = [];
+    var current = [];
+    for (var i = 0; i < blocks.length; i++) {
+      var b = blocks[i];
+      if (b.type === 'header' && b.level <= 2 && current.length) {
+        sections.push(current);
+        current = [];
+      }
+      current.push(b);
     }
-    rawChunks.push({ lines: currentChunkLines });
-  }
+    if (current.length) sections.push(current);
 
-  const parts = [];
-  const totalChunks = rawChunks.length;
-
-  for (let i = 0; i < totalChunks; i++) {
-    let content = rawChunks[i].lines.join("\n");
-    if (addMarkers) {
-      const marker = "[Part " + (i + 1) + " of " + totalChunks + "]\n";
-      content = marker + content;
+    var out = [];
+    for (var s = 0; s < sections.length; s++) {
+      var text2 = sections[s].map(function (b) { return b.text; }).join('\n\n');
+      if (byteLength(text2) <= maxBytes) {
+        out.push(text2);
+      } else {
+        out = out.concat(splitBySize(sections[s], maxBytes));
+      }
     }
-    const filename = "chat_response_part_" + (i + 1) + ".txt";
-    const savedPath = Android.writeFile(filename, content);
-    parts.push(savedPath);
-
-    const percent = Math.round(((i + 1) / totalChunks) * 100);
-    Android.reportProgress(percent);
+    return out;
   }
 
+  function splitCodeIsolated(blocks, maxBytes) {
+    var prose = blocks.filter(function (b) { return b.type !== 'code'; });
+    var code = blocks.filter(function (b) { return b.type === 'code'; });
+    var codeParts = [];
+    for (var i = 0; i < code.length; i++) {
+      var b = code[i];
+      if (byteLength(b.text) > maxBytes) codeParts = codeParts.concat(splitCodeBlock(b, maxBytes));
+      else codeParts.push(b.text);
+    }
+    return { prose: splitBySize(prose, maxBytes), code: codeParts };
+  }
+
+  // ---- run selected strategy ----
+  var blocks = parseBlocks(text);
+  window.progressUpdate(40);
+
+  var writtenPaths = [];
+  var totalChunks = 0;
+
+  function writeParts(chunks, prefix) {
+    var total = chunks.length;
+    for (var i = 0; i < chunks.length; i++) {
+      var content = chunks[i];
+      if (addMarkers) {
+        content = '[Part ' + (i + 1) + '/' + total + ']\n' + content;
+      }
+      var name = prefix + '_part' + (i + 1) + '_of_' + total + '.txt';
+      var path = Android.writeFile(name, content);
+      writtenPaths.push(path);
+      totalChunks++;
+      window.progressUpdate(40 + Math.round(((i + 1) / total) * 55));
+    }
+  }
+
+  if (strategy === 'code-isolated') {
+    var result = splitCodeIsolated(blocks, effectiveMax);
+    writeParts(result.prose, 'chat_response_prose');
+    writeParts(result.code, 'chat_response_code');
+  } else if (strategy === 'section') {
+    writeParts(splitBySection(blocks, effectiveMax), 'chat_response_section');
+  } else {
+    writeParts(splitBySize(blocks, effectiveMax), 'chat_response');
+  }
+
+  window.progressUpdate(100);
   return JSON.stringify({
-    totalChunks: parts.length,
-    strategy: strategy,
-    parts: parts
+    parts: writtenPaths,
+    totalChunks: totalChunks,
+    totalSize: fileSize,
+    strategy: strategy
   });
 }
             """.trimIndent(),
